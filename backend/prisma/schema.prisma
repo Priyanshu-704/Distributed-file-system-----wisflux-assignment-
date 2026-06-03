@@ -1,0 +1,45 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+enum UploadStatus {
+  PENDING
+  UPLOADING
+  COMPLETED
+  FAILED
+}
+
+model UploadSession {
+  id             String        @id @default(uuid())
+  fileName       String
+  fileSize       BigInt
+  mimeType       String
+  totalChunks    Int
+  uploadedChunks Int[]         // Array of uploaded chunk indices (0-indexed)
+  status         UploadStatus  @default(PENDING)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  processedFile  ProcessedFile?
+}
+
+model ProcessedFile {
+  id                 String        @id @default(uuid())
+  uploadSessionId    String        @unique
+  uploadSession      UploadSession @relation(fields: [uploadSessionId], references: [id], onDelete: Cascade)
+  originalName       String
+  processedName      String
+  fileSize           BigInt
+  mimeType           String
+  filePath           String
+  processingDuration Int           // in milliseconds
+  status             String        // PROCESSING, COMPLETED, FAILED
+  errorMessage       String?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+}
