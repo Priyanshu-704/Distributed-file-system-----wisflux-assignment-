@@ -2,7 +2,7 @@ import { Worker, Job } from "bullmq";
 import fs from "fs";
 import path from "path";
 import { createClient } from "redis";
-import { prisma } from "./prisma";
+import { pool } from "./db";
 import { logger } from "./logger";
 
 const redisConnection = {
@@ -61,10 +61,10 @@ const worker = new Worker(
     logger.info(`Started job ${job.id} for session ${sessionId} (Attempt ${job.attemptsMade + 1}/3)`);
 
     // 1. Update DB to PROCESSING
-    await prisma.processedFile.update({
-      where: { id: processedFileId },
-      data: { status: "PROCESSING" },
-    });
+    await pool.query(
+      `UPDATE processed_files SET status = 'PROCESSING', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [processedFileId]
+    );
 
     // Publish start event
     await publishUpdate({
@@ -115,15 +115,14 @@ const worker = new Worker(
     const duration = Date.now() - startTime;
 
     // 5. Update DB to COMPLETED
-    const updatedProcessedFile = await prisma.processedFile.update({
-      where: { id: processedFileId },
-      data: {
-        status: "COMPLETED",
-        processedName: processedFileName,
-        filePath: processedFilePath,
-        processingDuration: duration,
-      },
-    });
+    const updatedProcessedFileRes = await pool.query(
+      `UPDATE processed_files 
+       SET status = 'COMPLETED', processed_name = $1, file_path = $2, processing_duration = $3, updated_at = CURRENT_TIMESTAMP 
+       WHERE id = $4 
+       RETURNING id, processed_name AS "processedName", file_path AS "filePath", processing_duration AS "processingDuration", status`,
+      [processedFileName, processedFilePath, duration, processedFileId]
+    );
+    const updatedProcessedFile = updatedProcessedFileRes.rows[0];
 
     // Publish completion event
     await publishUpdate({
@@ -170,13 +169,14 @@ worker.on("failed", async (job, err) => {
     if (attemptsMade >= maxAttempts) {
       logger.error(`Job ${job.id} has exhausted all ${maxAttempts} retries. Marking ProcessedFile as FAILED.`);
       
-      const updatedProcessedFile = await prisma.processedFile.update({
-        where: { id: processedFileId },
-        data: {
-          status: "FAILED",
-          errorMessage: err.message,
-        },
-      });
+      const updatedProcessedFileRes = await pool.query(
+        `UPDATE processed_files 
+         SET status = 'FAILED', error_message = $1, updated_at = CURRENT_TIMESTAMP 
+         WHERE id = $2 
+         RETURNING id, status, error_message AS "errorMessage"`,
+        [err.message, processedFileId]
+      );
+      const updatedProcessedFile = updatedProcessedFileRes.rows[0];
 
       // Publish failure event
       await publishUpdate({
