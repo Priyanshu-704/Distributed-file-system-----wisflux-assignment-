@@ -25,6 +25,7 @@ CREATE TABLE processed_files (
     processing_duration INTEGER NOT NULL DEFAULT 0,
     status VARCHAR(50) NOT NULL,
     error_message TEXT,
+    minio_key TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );

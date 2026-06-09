@@ -3,6 +3,7 @@ import multer from "multer";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import * as Minio from "minio";
 import { pool } from "../db";
 import { logger } from "../logger";
 import { validate } from "../middleware/validate";
@@ -256,6 +257,7 @@ router.post(
           processedFileId: processedFile.id,
           filePath: mergedFilePath,
           fileName: session.fileName,
+          mimeType: session.mimeType,
         },
         {
           jobId: sessionId, // ensures duplicate prevention for this session
@@ -292,6 +294,7 @@ router.get(
              'fileSize', p.file_size,
              'mimeType', p.mime_type,
              'filePath', p.file_path,
+             'minioKey', p.minio_key,
              'processingDuration', p.processing_duration,
              'status', p.status,
              'errorMessage', p.error_message,
@@ -335,6 +338,7 @@ router.get(
              'fileSize', p.file_size,
              'mimeType', p.mime_type,
              'filePath', p.file_path,
+             'minioKey', p.minio_key,
              'processingDuration', p.processing_duration,
              'status', p.status,
              'errorMessage', p.error_message,
@@ -372,7 +376,7 @@ router.delete(
       const { sessionId } = req.params;
 
       const sessionRes = await pool.query(
-        `SELECT u.file_name AS "fileName", p.file_path AS "filePath" 
+        `SELECT u.file_name AS "fileName", u.mime_type AS "mimeType", p.file_path AS "filePath", p.minio_key AS "minioKey" 
          FROM upload_sessions u 
          LEFT JOIN processed_files p ON u.id = p.upload_session_id 
          WHERE u.id = $1`,
@@ -403,6 +407,28 @@ router.delete(
         if (fs.existsSync(session.filePath)) {
           fs.unlinkSync(session.filePath);
           logger.info(`Deleted processed output file at ${session.filePath}`);
+        }
+      }
+
+      // Delete from MinIO if exists
+      if (session.minioKey) {
+        try {
+          const minioClient = new Minio.Client({
+            endPoint: process.env.MINIO_ENDPOINT || "minio",
+            port: parseInt(process.env.MINIO_PORT || "9000"),
+            useSSL: process.env.MINIO_USE_SSL === "true",
+            accessKey: process.env.MINIO_ACCESS_KEY || "minio_admin",
+            secretKey: process.env.MINIO_SECRET_KEY || "minio_password_123",
+          });
+          const isImage = (session.mimeType && session.mimeType.startsWith("image/")) || 
+                          /\.(jpg|jpeg|png|gif|webp|bmp|tiff)$/i.test(session.fileName);
+          const bucketName = isImage
+            ? (process.env.MINIO_BUCKET || "pipeline-uploads")
+            : ((process.env.MINIO_BUCKET || "pipeline-uploads") + "-files");
+          await minioClient.removeObject(bucketName, session.minioKey);
+          logger.info(`Deleted MinIO object ${session.minioKey} from bucket ${bucketName} for session ${sessionId}`);
+        } catch (err: any) {
+          logger.error(`Failed to delete object from MinIO: ${err.message}`);
         }
       }
 

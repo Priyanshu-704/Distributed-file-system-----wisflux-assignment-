@@ -380,6 +380,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
                 </div>
               )}
 
+              {selectedSession.processedFile?.minioKey && (
+                <div className="flex flex-col gap-1 py-2 border-b border-slate-50">
+                  <span className="text-slate-400 font-semibold text-xs uppercase tracking-wider">MinIO Storage Object Key</span>
+                  <span className="font-mono text-[11px] text-slate-600 bg-slate-50 p-2 rounded border border-slate-100 select-all break-all leading-normal">
+                    {selectedSession.processedFile.minioKey}
+                  </span>
+                </div>
+              )}
+
               {selectedSession.processedFile?.errorMessage && (
                 <div className="flex flex-col gap-1 py-2 text-rose-800 bg-rose-50 p-3 rounded-xl border border-rose-100 mt-2">
                   <span className="font-bold text-xs uppercase tracking-wider text-rose-700">Failure Message</span>

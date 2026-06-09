@@ -12,7 +12,7 @@ export interface ActiveFileState {
   totalChunks: number;
   uploadedChunks: number[];
   currentChunkIndex: number;
-  status: "hashing" | "uploading" | "paused" | "merging" | "processing" | "completed" | "failed";
+  status: "waiting" | "hashing" | "uploading" | "paused" | "merging" | "processing" | "completed" | "failed";
   progress: number;
   processingProgress: number;
   error?: string;
@@ -46,6 +46,7 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
   const pausedFlagsRef = useRef<Map<string, boolean>>(new Map()); // sessionId -> isPaused
   const runningLoopsRef = useRef<Set<string>>(new Set()); // sessionId -> isRunning
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const startingKeysRef = useRef<Set<string>>(new Set());
 
   // Sync ref to avoid stale closures in sequential loops
   useEffect(() => {
@@ -299,33 +300,50 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
     }
   };
 
-  const handleFile = async (file: File) => {
-    onFilesSelected(1);
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    const tempKey = `temp_${Date.now()}_${file.name}`;
+  // Concurrency scheduler effect
+  useEffect(() => {
+    const MAX_CONCURRENT_UPLOADS = 3;
+    const activeUploads = Array.from(uploads.values()).filter(
+      (u) => u.status === "hashing" || u.status === "uploading" || u.status === "merging"
+    );
 
-    // 1. Set initial file selection state under temp key
-    const freshState: ActiveFileState = {
-      sessionId: "",
-      file,
-      fileName: file.name,
-      fileSize: file.size,
-      totalChunks,
-      uploadedChunks: [],
-      currentChunkIndex: 0,
-      status: "hashing",
-      progress: 0,
-      processingProgress: 0,
-    };
+    // Count temporary keys currently initiating
+    const startingCount = Array.from(uploads.keys()).filter(
+      (key) => startingKeysRef.current.has(key)
+    ).length;
 
+    const totalActive = activeUploads.length + startingCount;
+
+    if (totalActive < MAX_CONCURRENT_UPLOADS) {
+      const nextToUpload = Array.from(uploads.entries()).find(
+        ([tempKey, u]) => u.status === "waiting" && !startingKeysRef.current.has(tempKey)
+      );
+
+      if (nextToUpload) {
+        const [tempKey, waitingFile] = nextToUpload;
+        startUpload(tempKey, waitingFile);
+      }
+    }
+  }, [uploads]);
+
+  const startUpload = async (tempKey: string, waitingState: ActiveFileState) => {
+    // 1. Mark as starting in the Ref synchronously to prevent scheduling races
+    startingKeysRef.current.add(tempKey);
+
+    // 2. Instantly set status to "hashing" to take the concurrency slot
     setUploads((prev) => {
       const next = new Map(prev);
-      next.set(tempKey, freshState);
+      const current = next.get(tempKey);
+      if (current && current.status === "waiting") {
+        next.set(tempKey, { ...current, status: "hashing" });
+      }
       return next;
     });
 
     try {
-      // 2. Initiate session
+      const { file, totalChunks } = waitingState;
+      
+      // 3. Initiate session
       const session = await api.upload.initiate({
         fileName: file.name,
         fileSize: file.size,
@@ -334,7 +352,7 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
       });
 
       const initializedState: ActiveFileState = {
-        ...freshState,
+        ...waitingState,
         sessionId: session.id,
         status: "uploading",
       };
@@ -356,7 +374,7 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
       // Force instant updates sync to ref before calling processor loop
       uploadsRef.current.set(session.id, initializedState);
 
-      // 3. Begin sequential push
+      // 4. Begin sequential push
       await processChunks(session.id);
 
     } catch (err: any) {
@@ -365,8 +383,34 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
         next.delete(tempKey);
         return next;
       });
-      alert(`Failed to initiate upload session: ${err.message || err}`);
+      alert(`Failed to initiate upload session for ${waitingState.fileName}: ${err.message || err}`);
+    } finally {
+      startingKeysRef.current.delete(tempKey);
     }
+  };
+
+  const addToQueue = (file: File) => {
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const tempKey = `temp_${Date.now()}_${Math.random().toString(36).substring(2, 9)}_${file.name}`;
+
+    const waitingState: ActiveFileState = {
+      sessionId: "",
+      file,
+      fileName: file.name,
+      fileSize: file.size,
+      totalChunks,
+      uploadedChunks: [],
+      currentChunkIndex: 0,
+      status: "waiting",
+      progress: 0,
+      processingProgress: 0,
+    };
+
+    setUploads((prev) => {
+      const next = new Map(prev);
+      next.set(tempKey, waitingState);
+      return next;
+    });
   };
 
   const triggerPause = (sessionId: string) => {
@@ -427,12 +471,9 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
     }
   };
 
-  const triggerRestart = async (sessionId: string) => {
+  const triggerRestart = (sessionId: string) => {
     const current = uploadsRef.current.get(sessionId);
     if (!current) return;
-    
-    // Reset control variables and re-initialize completely
-    pausedFlagsRef.current.set(sessionId, false);
     
     // Remove old session ID mapping from list
     setUploads((prev) => {
@@ -440,8 +481,10 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
       next.delete(sessionId);
       return next;
     });
+    
+    pausedFlagsRef.current.delete(sessionId);
 
-    await handleFile(current.file);
+    addToQueue(current.file);
   };
 
   const triggerDismiss = (key: string) => {
@@ -469,13 +512,17 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
     e.stopPropagation();
     setDragActive(false);
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      Array.from(e.dataTransfer.files).forEach((file) => handleFile(file));
+      const selectedFiles = Array.from(e.dataTransfer.files);
+      onFilesSelected(selectedFiles.length);
+      selectedFiles.forEach((file) => addToQueue(file));
     }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      Array.from(e.target.files).forEach((file) => handleFile(file));
+      const selectedFiles = Array.from(e.target.files);
+      onFilesSelected(selectedFiles.length);
+      selectedFiles.forEach((file) => addToQueue(file));
       e.target.value = ""; // Reset value to allow selecting same file again
     }
   };
@@ -483,6 +530,8 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
   // State machine styling & badges helpers
   const getBadgeStyle = (status: string) => {
     switch (status) {
+      case "waiting":
+        return "bg-slate-100 text-slate-500 border-slate-200";
       case "hashing":
         return "bg-slate-100 text-slate-700 border-slate-200";
       case "uploading":
@@ -504,6 +553,8 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
 
   const getStatusText = (upload: ActiveFileState) => {
     switch (upload.status) {
+      case "waiting":
+        return "Waiting in queue...";
       case "hashing":
         return "Calculating cryptographic integrity hash...";
       case "uploading":
@@ -661,7 +712,9 @@ export const FileUploader: React.FC<FileUploaderProps> = ({
                     <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
                       <div
                         className={`h-full rounded-full transition-all duration-300 ${
-                          upload.status === "paused"
+                          upload.status === "waiting"
+                            ? "bg-slate-300"
+                            : upload.status === "paused"
                             ? "bg-amber-500"
                             : upload.status === "failed"
                             ? "bg-rose-500"

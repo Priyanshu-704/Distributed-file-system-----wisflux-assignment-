@@ -21,6 +21,7 @@ export interface ProcessedFile {
   fileSize: string;
   mimeType: string;
   filePath: string;
+  minioKey?: string | null;
   processingDuration: number;
   status: 'PROCESSING' | 'COMPLETED' | 'FAILED';
   errorMessage: string | null;

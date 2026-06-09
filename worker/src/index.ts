@@ -1,9 +1,31 @@
 import { Worker, Job } from "bullmq";
 import fs from "fs";
 import path from "path";
+import zlib from "zlib";
+import { pipeline } from "stream";
+import { promisify } from "util";
 import { createClient } from "redis";
+import * as Minio from "minio";
+import Jimp from "jimp";
 import { pool } from "./db";
 import { logger } from "./logger";
+
+const pipe = promisify(pipeline);
+
+const compressFile = async (inputPath: string, outputPath: string) => {
+  const source = fs.createReadStream(inputPath);
+  const destination = fs.createWriteStream(outputPath);
+  const gzip = zlib.createGzip();
+  await pipe(source, gzip, destination);
+};
+
+const minioClient = new Minio.Client({
+  endPoint: process.env.MINIO_ENDPOINT || "minio",
+  port: parseInt(process.env.MINIO_PORT || "9000"),
+  useSSL: process.env.MINIO_USE_SSL === "true",
+  accessKey: process.env.MINIO_ACCESS_KEY || "minio_admin",
+  secretKey: process.env.MINIO_SECRET_KEY || "minio_password_123",
+});
 
 const redisConnection = {
   host: process.env.REDIS_HOST || "redis",
@@ -50,12 +72,13 @@ interface FileJobData {
   processedFileId: string;
   filePath: string;
   fileName: string;
+  mimeType: string;
 }
 
 const worker = new Worker(
   "file-processing",
   async (job: Job<FileJobData>) => {
-    const { sessionId, processedFileId, filePath, fileName } = job.data;
+    const { sessionId, processedFileId, filePath, fileName, mimeType } = job.data;
     const startTime = Date.now();
 
     logger.info(`Started job ${job.id} for session ${sessionId} (Attempt ${job.attemptsMade + 1}/3)`);
@@ -109,18 +132,93 @@ const worker = new Worker(
     const processedFileName = `processed_${sessionId}_${fileName}`;
     const processedFilePath = path.join(PROCESSED_DIR, processedFileName);
 
-    // Read input and write to output file
-    fs.copyFileSync(filePath, processedFilePath);
+    const isImage = (mimeType && mimeType.startsWith("image/")) || 
+                    /\.(jpg|jpeg|png|gif|webp|bmp|tiff)$/i.test(fileName);
+
+    let minioKey: string | null = null;
+    
+    if (isImage) {
+      // 1. Upload original file to MinIO image bucket
+      try {
+        const bucketName = process.env.MINIO_BUCKET || "pipeline-uploads";
+        const bucketExists = await minioClient.bucketExists(bucketName);
+        if (!bucketExists) {
+          await minioClient.makeBucket(bucketName, "us-east-1");
+          logger.info(`Created MinIO bucket: ${bucketName}`);
+        }
+        
+        const objectName = `${sessionId}_${fileName}`;
+        logger.info(`Uploading original image to MinIO bucket ${bucketName} as ${objectName}...`);
+        await minioClient.fPutObject(bucketName, objectName, filePath);
+        minioKey = objectName;
+        logger.info(`Successfully uploaded original image to MinIO.`);
+      } catch (err: any) {
+        logger.error(`MinIO upload failed: ${err.message}`);
+        throw new Error(`Failed to upload original image to MinIO: ${err.message}`);
+      }
+
+      // 2. Generate thumbnail using Jimp for images
+      try {
+        logger.info(`Generating thumbnail using Jimp for ${fileName}...`);
+        const image = await Jimp.read(filePath);
+        await image
+          .resize(300, Jimp.AUTO)
+          .quality(75)
+          .writeAsync(processedFilePath);
+        logger.info(`Successfully generated and saved thumbnail at ${processedFilePath}`);
+      } catch (err: any) {
+        logger.warn(`Jimp thumbnail generation failed: ${err.message}. Falling back to copying original file.`);
+        fs.copyFileSync(filePath, processedFilePath);
+      }
+    } else {
+      // 1. Compress the file using gzip
+      const compressedTempPath = `${filePath}.gz`;
+      try {
+        logger.info(`Compressing non-image file ${fileName} using gzip...`);
+        await compressFile(filePath, compressedTempPath);
+        logger.info(`Successfully compressed to ${compressedTempPath}`);
+      } catch (err: any) {
+        logger.error(`Compression failed: ${err.message}`);
+        throw new Error(`Failed to compress file: ${err.message}`);
+      }
+
+      // 2. Upload compressed file to MinIO files bucket
+      try {
+        const bucketName = (process.env.MINIO_BUCKET || "pipeline-uploads") + "-files";
+        const bucketExists = await minioClient.bucketExists(bucketName);
+        if (!bucketExists) {
+          await minioClient.makeBucket(bucketName, "us-east-1");
+          logger.info(`Created MinIO bucket: ${bucketName}`);
+        }
+        
+        const objectName = `${sessionId}_${fileName}.gz`;
+        logger.info(`Uploading compressed file to MinIO bucket ${bucketName} as ${objectName}...`);
+        await minioClient.fPutObject(bucketName, objectName, compressedTempPath);
+        minioKey = objectName;
+        logger.info(`Successfully uploaded compressed file to MinIO.`);
+      } catch (err: any) {
+        logger.error(`MinIO upload failed: ${err.message}`);
+        throw new Error(`Failed to upload compressed file to MinIO: ${err.message}`);
+      } finally {
+        // Clean up temporary compressed file
+        if (fs.existsSync(compressedTempPath)) {
+          fs.unlinkSync(compressedTempPath);
+        }
+      }
+
+      // 3. Read input and write to output file for non-images (videos, zip files, etc.)
+      fs.copyFileSync(filePath, processedFilePath);
+    }
 
     const duration = Date.now() - startTime;
 
     // 5. Update DB to COMPLETED
     const updatedProcessedFileRes = await pool.query(
       `UPDATE processed_files 
-       SET status = 'COMPLETED', processed_name = $1, file_path = $2, processing_duration = $3, updated_at = CURRENT_TIMESTAMP 
-       WHERE id = $4 
-       RETURNING id, processed_name AS "processedName", file_path AS "filePath", processing_duration AS "processingDuration", status`,
-      [processedFileName, processedFilePath, duration, processedFileId]
+       SET status = 'COMPLETED', processed_name = $1, file_path = $2, minio_key = $3, processing_duration = $4, updated_at = CURRENT_TIMESTAMP 
+       WHERE id = $5 
+       RETURNING id, processed_name AS "processedName", file_path AS "filePath", minio_key AS "minioKey", processing_duration AS "processingDuration", status`,
+      [processedFileName, processedFilePath, minioKey, duration, processedFileId]
     );
     const updatedProcessedFile = updatedProcessedFileRes.rows[0];
 
@@ -135,6 +233,7 @@ const worker = new Worker(
         id: updatedProcessedFile.id,
         processedName: updatedProcessedFile.processedName,
         filePath: updatedProcessedFile.filePath,
+        minioKey: updatedProcessedFile.minioKey,
         processingDuration: updatedProcessedFile.processingDuration,
         status: updatedProcessedFile.status,
       },

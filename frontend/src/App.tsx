@@ -87,6 +87,7 @@ function App() {
                 fileSize: session.fileSize,
                 mimeType: session.mimeType,
                 filePath: data.processedFile?.filePath || existingProc?.filePath || "",
+                minioKey: data.processedFile?.minioKey || existingProc?.minioKey || null,
                 processingDuration: data.processedFile?.processingDuration || existingProc?.processingDuration || 0,
                 status: data.status === "RETRYING" ? "PROCESSING" : (data.status as any),
                 errorMessage: data.errorMessage || null,
