@@ -155,6 +155,37 @@ services:
     networks:
       - pipeline-network
 
+  pgweb:
+    image: sosedoff/pgweb:latest
+    container_name: pipeline_pgweb
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      - PGWEB_DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - pipeline-network
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: pipeline_redis_commander
+    restart: unless-stopped
+    ports:
+      - "8082:8081"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - pipeline-network
+
+
 networks:
   pipeline-network:
     name: pipeline_network
